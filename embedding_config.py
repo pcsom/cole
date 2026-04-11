@@ -1,0 +1,156 @@
+"""
+Configuration file for LLM embeddings.
+Add new models here to easily extend the corpus with additional embeddings.
+"""
+
+# Global configuration flags
+FORCE_RECOMPUTE_EMBEDDINGS = False  # Set to True to force recomputing existing embeddings
+FORCE_RERUN_EXPERIMENTS = False     # Set to True to force rerunning existing experiments
+NASBENCH_201_API_PATH = ""
+
+# Model configurations for embedding
+# Add new models by appending to this list
+MODEL_CONFIGS = [
+    {
+        'name': 'deepseek-ai/DeepSeek-Coder-V2-Lite-Base',
+        'display_name': 'deepseek_coder',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'answerdotai/ModernBERT-base',
+        'display_name': 'modernbert',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'answerdotai/ModernBERT-large',
+        'display_name': 'modernbert_large',
+        'sentence_transformer': False
+    },
+    # Add more models here as needed
+    {
+        'name': 'microsoft/codebert-base',
+        'display_name': 'codebert',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'codellama/CodeLlama-34b-hf',
+        'display_name': 'codellama_34b',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'codellama/CodeLlama-34b-Python-hf',
+        'display_name': 'codellama_python_34b',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'codellama/CodeLlama-34b-Instruct-hf',
+        'display_name': 'codellama_instruct_34b',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'codellama/CodeLlama-7b-Python-hf',
+        'display_name': 'codellama_python_7b',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'codellama/CodeLlama-70b-Python-hf',
+        'display_name': 'codellama_python_70b',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'codellama/CodeLlama-7b-hf',
+        'display_name': 'codellama_7b',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'codellama/CodeLlama-7b-Instruct-hf',
+        'display_name': 'codellama_instruct_7b',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'Qwen/Qwen2.5-Coder-7B',
+        'display_name': 'qwen_2_5_coder_7b',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'Qwen/Qwen3-Coder-30B-A3B-Instruct',
+        'display_name': 'qwen_3_coder_30b_instruct',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'meta-llama/Llama-3.1-8B',
+        'display_name': 'llama_3_1_8b',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'meta-llama/Llama-3.3-70B-Instruct',
+        'display_name': 'llama_3_3_70b_instruct',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'deepseek-ai/deepseek-coder-6.7b-instruct',
+        'display_name': 'deepseek_coder_6_7b_instruct',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'Qwen/Qwen2.5-Coder-0.5B',
+        'display_name': 'qwen_coder_0_5b',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'mistralai/Codestral-22B-v0.1',
+        'display_name': 'codestral_22b',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'mistralai/Mixtral-8x7B-v0.1',
+        'display_name': 'mixtral_8x7b',
+        'sentence_transformer': False
+    },
+    {
+        'name': '01-ai/Yi-Coder-9B',
+        'display_name': 'yi_coder_9b',
+        'sentence_transformer': False
+    },
+    {
+        'name': '01-ai/Yi-Coder-1.5B',
+        'display_name': 'yi_coder_1_5b',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'nomic-ai/CodeRankEmbed',
+        'display_name': 'coderankembed',
+        'sentence_transformer': True
+    },
+    {
+        'name': 'jinaai/jina-embeddings-v2-base-code',
+        'display_name': 'jina_embed_code',
+        'sentence_transformer': True
+    },
+    {
+        'name': 'jinaai/jina-code-embeddings-1.5b',
+        'display_name': 'jina_embed_code_1_5b',
+        'sentence_transformer': True
+    },
+    {
+        'name': 'nomic-ai/nomic-embed-code',
+        'display_name': 'nomic_embed_code',
+        'sentence_transformer': True
+    },
+    {
+        'name': 'Salesforce/SFR-Embedding-Code-2B_R',
+        'display_name': 'sfr_embedding_code_2b_r',
+        'sentence_transformer': True
+    },
+]
+
+def get_model_config(display_name):
+    """Get model configuration by display name."""
+    for config in MODEL_CONFIGS:
+        if config['display_name'] == display_name:
+            return config
+    return None
+
+def get_all_model_names():
+    """Get list of all model display names."""
+    return [config['display_name'] for config in MODEL_CONFIGS]

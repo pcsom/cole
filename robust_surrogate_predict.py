@@ -1,0 +1,1183 @@
+"""
+Robust surrogate prediction with corrected statistical testing.
+Implements subsampled repeated k-fold CV with corrected paired t-test.
+
+Methodology:
+  - "Split First, Subsample Later": K-fold creates train_pool/test (e.g., 6250/1562),
+    then subsample exactly N (15, 50, 150, etc.) from train_pool for training
+  - Constant test size ensures stable evaluation even with tiny training sets
+  - Target scaling (mean=0, std=1) for balanced gradients, NO feature scaling
+  - Primary Metric: Kendall's Tau (rank correlation)
+
+Based on Nadeau & Bengio (2003): Inference for the Generalization Error
+"""
+
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+from softpca import SoftPCA
+import umap
+from tqdm import tqdm
+import scipy.stats as stats
+from scipy.stats import kendalltau
+from typing import List, Dict, Optional, Tuple
+import os
+from results_io import save_per_embedding_results, save_comparison_results, split_results_for_saving, load_existing_trials
+from stat_utils import corrected_paired_ttest
+from heads import MLPSurrogate, XGBoostSurrogate, MultiLayerPerceiverSurrogate
+
+class FlanPairwiseHingeLoss(nn.Module):
+    """Pairwise hinge loss for learning-to-rank architectures.
+    
+    Implements FLAN-style pairwise ranking loss:
+    - Compares pairs of architectures where accuracies differ
+    - Learns to predict relative ordering (not absolute values)
+    - More robust for architecture search than MSE
+    
+    Args:
+        margin: Minimum difference margin for ranking pairs
+        max_compare_ratio: Maximum number of pairs relative to batch size
+    """
+    def __init__(self, margin=0.1, max_compare_ratio=4.0):
+        super().__init__()
+        self.margin = margin
+        self.max_compare_ratio = max_compare_ratio
+        self.criterion = nn.MarginRankingLoss(margin=margin, reduction='mean')
+
+    def forward(self, pred_scores, target_accs):
+        """
+        Args:
+            pred_scores: (Batch_Size, 1) - The raw model outputs
+            target_accs: (Batch_Size, 1) - The ground truth accuracies
+        """
+        batch_size = pred_scores.size(0)
+        
+        # 1. Generate all pairwise indices (Upper Triangle)
+        acc_np = target_accs.detach().cpu().numpy().flatten()
+        
+        # Calculate differences: matrix[i, j] = acc[i] - acc[j]
+        acc_diff = acc_np[:, None] - acc_np
+        
+        # Get indices where difference is non-zero (triu to avoid duplicates/self)
+        r_idx, c_idx = np.triu_indices(batch_size, k=1)
+        
+        valid_mask = np.abs(acc_diff[r_idx, c_idx]) > 0.0
+        r_idx = r_idx[valid_mask]
+        c_idx = c_idx[valid_mask]
+        
+        # 2. FLAN's "Max Compare Ratio" Sampling Logic
+        # If we have too many pairs, randomly downsample them.
+        n_max_pairs = int(self.max_compare_ratio * batch_size)
+        current_pairs = len(r_idx)
+        
+        if current_pairs > n_max_pairs:
+            # Randomly select a subset of pairs (No replacement, as per FLAN)
+            keep_inds = np.random.choice(current_pairs, n_max_pairs, replace=False)
+            r_idx = r_idx[keep_inds]
+            c_idx = c_idx[keep_inds]
+            
+        # Get scores and squeeze to 1D for MarginRankingLoss
+        s_1 = pred_scores[r_idx].squeeze()
+        s_2 = pred_scores[c_idx].squeeze()
+        
+        target_diff = acc_diff[r_idx, c_idx]
+        target_sign = torch.tensor(np.sign(target_diff), device=pred_scores.device, dtype=torch.float)
+        
+        loss = self.criterion(s_1, s_2, target_sign)
+        
+        return loss
+
+
+def train_model_on_subsample(
+    X_train_pool, y_train_pool, X_test, y_test,
+    sample_size, random_state, epochs=100, lr=0.001, batch_size=16, device='cuda', patience=20,
+    dim_reduction_method=None, dim_reduction_components=None, pca_whitening_epsilon=None, use_pairwise_loss=False, use_single_target=False,
+    head_type='mlp'
+):
+    """
+    Train a model on a subsample of the training pool.
+    Implements "Split First, Subsample Later" methodology:
+      1. K-fold creates train_pool and test (done by caller)
+      2. We subsample exactly sample_size from train_pool
+      3. Train on the full subsample for fixed epochs
+      4. Test on the full test fold for stable evaluation
+    
+    Args:
+        X_train_pool: Full training pool features (from K-fold split)
+        y_train_pool: Full training pool targets
+        X_test: Test fold features (constant size for stable evaluation)
+        y_test: Test fold targets
+        sample_size: EXACT number of training samples (15, 50, 150, etc.)
+        random_state: Random seed
+        epochs: Training epochs (fixed, no early stopping)
+        lr: Learning rate
+        batch_size: Batch size
+        device: Device to use
+        patience: (Unused, kept for API compatibility)
+        dim_reduction_method: Dimensionality reduction method (None, 'softpca', or 'umap')
+        dim_reduction_components: Number of components for dimensionality reduction
+        pca_whitening_epsilon: Epsilon for SoftPCA whitening (only used if dim_reduction_method='softpca')
+        use_pairwise_loss: If True, use pairwise hinge loss instead of MSE
+        use_single_target: If True, train only on valid accuracy (single target) instead of both loss and accuracy
+        head_type: Type of head to use ('mlp', 'xgboost', or 'perceiver')
+    
+    Preprocessing:
+        - Features (embeddings): NOT scaled (sensitive distributions), but SoftPCA can be applied
+        - Targets (accuracy/loss): Scaled to mean=0, std=1 for balanced gradients
+    
+    Returns:
+        Dictionary with performance metrics
+    """
+    np.random.seed(random_state)
+    torch.manual_seed(random_state)
+    
+    # Subsample from training pool
+    n_pool = len(X_train_pool)
+    if sample_size > n_pool:
+        raise ValueError(f"sample_size ({sample_size}) > pool size ({n_pool})")
+    
+    indices = np.random.choice(n_pool, size=sample_size, replace=False)
+    X_train = X_train_pool[indices]
+    y_train = y_train_pool[indices]
+    
+    # Extract only accuracy column if single target mode
+    if use_single_target:
+        y_train = y_train[:, 1:2]  # Keep 2D shape (N, 1) for consistency
+        y_test = y_test[:, 1:2]
+    
+    # CRITICAL: Split First, Subsample Later methodology
+    # The subsample IS the full training set. We do NOT split it further.
+    # This ensures:
+    #   1. Training size is exactly what's specified (15, 50, 150, etc.)
+    #   2. Test set is constant size (full fold) for stable evaluation
+    #   3. We don't waste data - use all available test samples
+
+    is_multilayer = (X_train.ndim == 3)
+    
+    # Apply dimensionality reduction if requested (before scaling targets)
+    if dim_reduction_method in ['softpca', 'umap']:
+        if is_multilayer:
+            # --- SHARED-BASIS DIMENSIONALITY REDUCTION FOR MULTI-LAYER ---
+            N_train, L_train, D_dim = X_train.shape
+            N_test, L_test, _ = X_test.shape
+            
+            # 1. Flatten Layers into the Batch dimension
+            # We treat every layer of every sample as a data point to learn the basis
+            X_train_flat = X_train.reshape(-1, D_dim) # (N*L, 4096)
+            X_test_flat = X_test.reshape(-1, D_dim)   # (N*L, 4096)
+            
+            # 2. Determine components based on effective sample size or explicit arg
+            if dim_reduction_components is None:
+                raise ValueError(f"dim_reduction_components must be specified if dim_reduction_method is '{dim_reduction_method}'")
+            
+            # 3. Fit dimensionality reduction on flattened training data
+            if dim_reduction_method == 'softpca':
+                n_components = min(dim_reduction_components, X_train_flat.shape[0])
+                reducer = SoftPCA(n_components=n_components, epsilon=pca_whitening_epsilon, random_state=random_state)
+                X_train_flat = reducer.fit_transform(X_train_flat)
+                X_test_flat = reducer.transform(X_test_flat)
+            elif dim_reduction_method == 'umap':
+                n_components = dim_reduction_components
+                if n_components >= sample_size:
+                    reducer = umap.UMAP(n_components=n_components, init='random', random_state=random_state, n_jobs=-1)
+                else:
+                    reducer = umap.UMAP(n_components=n_components, random_state=random_state, n_jobs=-1)
+                X_train_flat = reducer.fit_transform(X_train_flat)
+                X_test_flat = reducer.transform(X_test_flat)
+            
+            # 4. Reshape back to 3D
+            # New shape: (N, L, n_components)
+            X_train = X_train_flat.reshape(N_train, L_train, -1)
+            X_test = X_test_flat.reshape(N_test, L_test, -1)
+            
+            print(f"  Multi-layer {dim_reduction_method.upper()}: Reduced {D_dim} -> {X_train.shape[2]} dims (Shared Basis)")
+        else:
+            # Determine number of components
+            if dim_reduction_components is None:
+                raise ValueError(f"dim_reduction_components must be specified if dim_reduction_method is '{dim_reduction_method}'")
+            
+            # Fit dimensionality reduction on training subsample, transform both train and test
+            if dim_reduction_method == 'softpca':
+                n_components = min(dim_reduction_components, sample_size)
+
+                reducer = SoftPCA(n_components=n_components, epsilon=pca_whitening_epsilon, random_state=random_state)
+                X_train = reducer.fit_transform(X_train)
+                X_test = reducer.transform(X_test)
+            elif dim_reduction_method == 'umap':
+                # n_components = dim_reduction_components
+                n_components = min(dim_reduction_components, sample_size-2)
+                if n_components >= sample_size:
+                    reducer = umap.UMAP(n_components=n_components, init='random', random_state=random_state, n_jobs=-1)
+                else:
+                    reducer = umap.UMAP(n_components=n_components, random_state=random_state, n_jobs=-1)
+                X_train = reducer.fit_transform(X_train)
+                X_test = reducer.transform(X_test)
+    
+    # Scale TARGETS (not features - embeddings have sensitive distributions)
+    target_scaler = StandardScaler()
+    y_train_scaled = target_scaler.fit_transform(y_train)
+    y_test_scaled = target_scaler.transform(y_test)
+    
+    # Create model with appropriate output dimension
+    input_dim = X_train.shape[1]
+    output_dim = 1 if use_single_target else 2
+    
+    # Select head type
+    if head_type == 'mlp':
+        model = MLPSurrogate(input_dim=input_dim, output_dim=output_dim).to(device)
+    elif head_type == 'xgboost':
+        model = XGBoostSurrogate(input_dim=input_dim, output_dim=output_dim, 
+                                random_state=random_state, device=device)
+    elif head_type == 'perceiver':
+        # For perceiver, X_train should be 3D: (N, num_layers, hidden_dim)
+        # If it's 2D, we can't use perceiver - fall back to MLP
+        if len(X_train.shape) == 3:
+            num_layers = X_train.shape[1]
+            model = MultiLayerPerceiverSurrogate(
+                input_dim=input_dim, 
+                num_layers_to_pool=num_layers,
+                output_dim=output_dim
+            ).to(device)
+        else:
+            raise ValueError("Perceiver head requires 3D input (N, num_layers, hidden_dim).")
+    else:
+        raise ValueError(f"Unknown head_type: {head_type}. Must be 'mlp', 'xgboost', or 'perceiver'")
+    
+    # XGBoost has different training procedure
+    if head_type == 'xgboost':
+        # XGBoost doesn't need tensor conversion or epochs
+        # Fit directly on scaled numpy arrays
+        model.fit(X_train, y_train_scaled)
+        
+        # Predict on test set (in scaled space)
+        test_pred_scaled = model.predict(X_test)
+        
+        # Inverse transform to original scale
+        test_pred = target_scaler.inverse_transform(test_pred_scaled)
+        test_true = y_test
+    else:
+        # PyTorch-based models (MLP, Perceiver)
+        # call nvidia-smi to debug mem usage
+        # os.system("nvidia-smi")
+        # Convert to tensors (features are NOT scaled)
+        X_train_t = torch.FloatTensor(X_train).to(device)
+        y_train_t = torch.FloatTensor(y_train_scaled).to(device)
+        X_test_t = torch.FloatTensor(X_test).to(device)
+        y_test_t = torch.FloatTensor(y_test_scaled).to(device)
+        
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+        
+        # Select loss criterion
+        if use_pairwise_loss:
+            criterion = FlanPairwiseHingeLoss(margin=0.1, max_compare_ratio=4.0)
+        else:
+            criterion = nn.MSELoss()
+        
+        # Training loop (fixed epochs, no early stopping)
+        model.train()
+        for epoch in range(epochs):
+            # Mini-batch training
+            for i in range(0, len(X_train_t), batch_size):
+                batch_X = X_train_t[i:i+batch_size]
+                batch_y = y_train_t[i:i+batch_size]
+                
+                optimizer.zero_grad()
+                outputs = model(batch_X)
+                
+                # Compute loss (works for both single and dual target)
+                if use_pairwise_loss:
+                    # Pairwise loss: if single target, outputs is (N,1), otherwise use accuracy column
+                    target_col = outputs if use_single_target else outputs[:, 1:2]
+                    batch_target = batch_y if use_single_target else batch_y[:, 1:2]
+                    loss = criterion(target_col, batch_target)
+                else:
+                    # MSE loss: works for both (N,1) and (N,2)
+                    loss = criterion(outputs, batch_y)
+                
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+        
+        # Evaluation on test set
+        model.eval()
+        with torch.no_grad():
+            # Test set predictions (in scaled space)
+            test_pred_scaled = model(X_test_t).cpu().numpy()
+            
+            # Inverse transform to original scale
+            test_pred = target_scaler.inverse_transform(test_pred_scaled)
+            test_true = y_test
+        
+    # Calculate metrics (for accuracy prediction)
+    if use_single_target:
+        acc_pred = test_pred[:, 0]  # Single column output
+        acc_true = test_true[:, 0]  # Single column target
+    else:
+        acc_pred = test_pred[:, 1]  # Second column (accuracy)
+        acc_true = test_true[:, 1]
+    
+    # 1. Check for NaNs in output (Gradient explosion)
+    if np.any(np.isnan(acc_pred)):
+        print(f"  WARNING: NaNs in prediction. Assigning Tau=0.0.")
+        return { 'kendall_tau': 0.0, 'mse': 999.0, 'n_train': sample_size, 'n_test': len(X_test) }
+    
+    pred_variance = np.var(acc_pred)
+    true_variance = np.var(acc_true)
+
+    # 2. Check for Soft Collapse (Variance is tiny but not zero)
+    pred_variance = np.var(acc_pred)
+    if pred_variance < 1e-7:  # Changed from == 0 to epsilon threshold
+        print(f"  WARNING: Soft model collapse (Var={pred_variance:.8f}). Assigning Tau=0.0.") 
+        ktau = 0.0
+    
+    # Kendall's Tau - PRIMARY METRIC for NAS
+    # Measures rank correlation: does the surrogate order architectures correctly?
+    # More robust than MSE for low-data regimes and non-linear relationships
+    try:
+        ktau, ktau_pvalue = kendalltau(acc_true, acc_pred)
+    except Exception:
+        ktau = np.nan # Catch internal scipy errors
+    
+    # 3. Handle NaN return from kendalltau (occurs with ties/constants)
+    if np.isnan(ktau):
+        print(f"  WARNING: kendalltau returned NaN (likely due to ties). Assigning Tau=0.0.")
+        ktau = 0.0      # Penalize the model
+    
+    # MSE (mean squared error)
+    mse = np.mean((acc_true - acc_pred) ** 2)
+    
+    return {
+        'kendall_tau': ktau,  # Primary metric
+        'mse': mse,
+        'n_train': sample_size,
+        'n_test': len(X_test)
+    }
+
+
+
+
+def subsampled_repeated_kfold_comparison(
+    X, y, embedding_types,
+    sample_sizes=[15, 50, 150, 500, 1500, 5000],
+    n_folds=5,
+    n_repeats=5,
+    model1_idx=0,
+    model2_idx=1,
+    epochs=100,
+    lr=0.001,
+    batch_size=32,
+    device='cuda',
+    random_state=42,
+    pairs_to_compute=None,
+    trial_data_dict=None,
+    existing_trials_dict=None,
+    dim_reduction_method_model1=None,
+    dim_reduction_method_model2=None,
+    dim_reduction_components_model1=None,
+    dim_reduction_components_model2=None,
+    pca_whitening_epsilon_model1=None,
+    pca_whitening_epsilon_model2=None,
+    use_pairwise_loss_model1=False,
+    use_pairwise_loss_model2=False,
+    use_single_target_model1=False,
+    use_single_target_model2=False,
+    head_type_model1='mlp',
+    head_type_model2='mlp',
+    per_embedding_output_dir=None,
+    comparison_output_path=None,
+    corpus1_name=None,
+    corpus2_name=None,
+    comparison_label=None
+):
+    """
+    Perform subsampled repeated k-fold CV with corrected statistical testing.
+    
+    Args:
+        X: Dictionary mapping embedding_type to feature arrays
+        y: Target array (same for all embedding types)
+        embedding_types: List of embedding type names
+        sample_sizes: List of training sample sizes to test
+        n_folds: Number of folds for CV
+        n_repeats: Number of repeats for each fold
+        model1_idx: Index of first model in embedding_types
+        model2_idx: Index of second model in embedding_types
+        epochs: Training epochs per model (fixed, no early stopping)
+        lr: Learning rate
+        batch_size: Batch size
+        device: Device to use
+        random_state: Base random seed
+        existing_results: DataFrame of existing results (optional)
+        pairs_to_compute: List of (sample_size, existing_trials, needed_trials) tuples
+        dim_reduction_method_model1: Dimensionality reduction for model 1 (None, 'softpca', or 'umap')
+        dim_reduction_method_model2: Dimensionality reduction for model 2 (None, 'softpca', or 'umap')
+        dim_reduction_components_model1: Number of components for model 1
+        dim_reduction_components_model2: Number of components for model 2
+        pca_whitening_epsilon_model1: Epsilon for SoftPCA whitening for model 1
+        pca_whitening_epsilon_model2: Epsilon for SoftPCA whitening for model 2
+        use_pairwise_loss_model1: If True, use pairwise hinge loss for model 1
+        use_pairwise_loss_model2: If True, use pairwise hinge loss for model 2
+        use_single_target_model1: If True, train model 1 only on valid accuracy
+        use_single_target_model2: If True, train model 2 only on valid accuracy
+        head_type_model1: Type of head for model 1 ('mlp', 'xgboost', or 'perceiver')
+        head_type_model2: Type of head for model 2 ('mlp', 'xgboost', or 'perceiver')
+    
+    Methodology:
+        - Split First, Subsample Later: K-fold creates train_pool/test, 
+          then we subsample EXACTLY sample_size from train_pool
+        - Target Scaling: Targets scaled to mean=0, std=1
+        - Feature Scaling: None (embeddings have sensitive distributions)
+        - PCA: Optional dimensionality reduction applied per fold
+        - Training: Fixed epochs on full subsample, test on full test fold
+    
+    Returns:
+        DataFrame with results for all sample sizes (only NEW trials)
+    """
+    model1_name = embedding_types[model1_idx]
+    model2_name = embedding_types[model2_idx]
+    
+    print(f"\n{'='*80}")
+    print(f"Computing additional trials for {model1_name} vs {model2_name}")
+    if pairs_to_compute:
+        print(f"Sample sizes to compute: {[p[0] for p in pairs_to_compute]}")
+    else:
+        print(f"Sample sizes: {sample_sizes}")
+    print(f"Folds: {n_folds}, Repeats: {n_repeats}")
+    print(f"{'='*80}\n")
+    
+    X1 = X[model1_name]
+    X2 = X[model2_name]
+    
+    results = []
+    
+    # For stratification, bin the continuous accuracy into 5 bins
+    y_acc = y[:, 1]  # Accuracy is the second column
+    y_bins = pd.qcut(y_acc, q=5, labels=False, duplicates='drop')
+    
+    for sample_size in sample_sizes:
+        print(f"\n--- Sample Size: {sample_size} ---")
+        
+        # Determine how many trials already exist from existing_trials_dict (loaded from Type 1 CSVs)
+        existing_trials_m1 = len(existing_trials_dict.get(model1_name, {}).get(sample_size, []))
+        existing_trials_m2 = len(existing_trials_dict.get(model2_name, {}).get(sample_size, []))
+        existing_trials = min(existing_trials_m1, existing_trials_m2)  # Both models must have same trials
+        
+        total_trials_needed = n_folds * n_repeats
+        trials_to_compute = total_trials_needed - existing_trials
+        
+        if trials_to_compute <= 0:
+            print(f"Already have {existing_trials} trials, no new computation needed")
+            print(f"Computing statistics and saving comparison results...")
+        else:
+            print(f"Computing {trials_to_compute} new trials (have {existing_trials}, need {total_trials_needed})")
+        
+        differences = []  # Store Model1 - Model2 for ONLY NEW trials
+        model1_ktau_scores = []  # Track individual model1 Kendall's Tau scores
+        model2_ktau_scores = []  # Track individual model2 Kendall's Tau scores
+        model1_mse_scores = []  # Track individual model1 MSE scores
+        model2_mse_scores = []  # Track individual model2 MSE scores
+        
+        differences_ktau = []  # Store Model1 - Model2 Kendall's Tau differences
+        differences_mse = []  # Store Model1 - Model2 MSE differences
+        
+        # Start from where we left off
+        start_trial = existing_trials
+        total_trials = 0
+        
+        # Only run trials if we need new ones
+        if trials_to_compute > 0:
+            # Outer loop: Repeat the CV procedure
+            for repeat in tqdm(range(n_repeats), desc=f"Repeats (S={sample_size})"):
+                # Create stratified k-fold with different seed per repeat
+                skf = StratifiedKFold(n_splits=n_folds, shuffle=True, 
+                                     random_state=random_state + repeat)
+                
+                # Inner loop: Folds
+                for fold_idx, (pool_idx, test_idx) in enumerate(skf.split(X1, y_bins)):
+                    trial_number = repeat * n_folds + fold_idx
+                    
+                    # Skip trials we already computed
+                    if trial_number < start_trial:
+                        continue
+                    
+                    if total_trials >= trials_to_compute:
+                        break
+                    
+                    # Training pool (4 folds)
+                    X1_pool, y_pool = X1[pool_idx], y[pool_idx]
+                    X2_pool = X2[pool_idx]
+                    
+                    # Test set (1 fold)
+                    X1_test, y_test = X1[test_idx], y[test_idx]
+                    X2_test = X2[test_idx]
+                    
+                    # Train Model 1
+                    seed1 = random_state + repeat * 1000 + fold_idx * 100
+                    result1 = train_model_on_subsample(
+                        X1_pool, y_pool, X1_test, y_test,
+                        sample_size=min(sample_size, len(X1_pool)),
+                        random_state=seed1,
+                        epochs=epochs, lr=lr, batch_size=batch_size, device=device,
+                        dim_reduction_method=dim_reduction_method_model1,
+                        dim_reduction_components=dim_reduction_components_model1,
+                        pca_whitening_epsilon=pca_whitening_epsilon_model1,
+                        use_pairwise_loss=use_pairwise_loss_model1,
+                        use_single_target=use_single_target_model1,
+                        head_type=head_type_model1
+                    )
+                    
+                    # Train Model 2 on SAME subsample indices
+                    seed2 = random_state + repeat * 1000 + fold_idx * 100 + 1
+                    result2 = train_model_on_subsample(
+                        X2_pool, y_pool, X2_test, y_test,
+                        sample_size=min(sample_size, len(X2_pool)),
+                        random_state=seed2,
+                        epochs=epochs, lr=lr, batch_size=batch_size, device=device,
+                        dim_reduction_method=dim_reduction_method_model2,
+                        dim_reduction_components=dim_reduction_components_model2,
+                        pca_whitening_epsilon=pca_whitening_epsilon_model2,
+                        use_pairwise_loss=use_pairwise_loss_model2,
+                        use_single_target=use_single_target_model2,
+                        head_type=head_type_model2
+                    )
+                    
+                    # Store individual scores and difference (using Kendall's Tau)
+                    score1 = result1['kendall_tau']
+                    score2 = result2['kendall_tau']
+                    model1_ktau_scores.append(score1)
+                    model2_ktau_scores.append(score2)
+                    diff_ktau = score1 - score2
+                    differences.append(diff_ktau)
+                    differences_ktau.append(diff_ktau)
+                    
+                    # Also store MSE scores and differences
+                    model1_mse_scores.append(result1['mse'])
+                    model2_mse_scores.append(result2['mse'])
+                    diff_mse = result1['mse'] - result2['mse']
+                    differences_mse.append(diff_mse)
+                    
+                    # Track individual NEW trial data for statistics and Type 1 CSV saving
+                    if trial_data_dict is not None:
+                        # Always track trials for statistics (needed for comparison)
+                        # Initialize dicts for model1 and model2 if not present
+                        if model1_name not in trial_data_dict:
+                            trial_data_dict[model1_name] = {}
+                        if model2_name not in trial_data_dict:
+                            trial_data_dict[model2_name] = {}
+                        
+                        # Initialize sample_size list if not present
+                        if sample_size not in trial_data_dict[model1_name]:
+                            trial_data_dict[model1_name][sample_size] = []
+                        if sample_size not in trial_data_dict[model2_name]:
+                            trial_data_dict[model2_name][sample_size] = []
+                        
+                        # Append NEW trial data: (fold, repeat, ktau, mse)
+                        trial_data_dict[model1_name][sample_size].append(
+                            (fold_idx, repeat, result1['kendall_tau'], result1['mse'])
+                        )
+                        trial_data_dict[model2_name][sample_size].append(
+                            (fold_idx, repeat, result2['kendall_tau'], result2['mse'])
+                        )
+                    
+                    total_trials += 1
+                
+                if total_trials >= trials_to_compute:
+                    break
+            
+            # Get fold sizes from last split (for reporting n_train, n_test)
+            # If we ran trials, pool_idx and test_idx are defined
+            n_train = len(pool_idx)
+            n_test = len(test_idx)
+        else:
+            # No new trials computed - use a single split to get n_train/n_test for reporting
+            skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+            pool_idx, test_idx = next(iter(skf.split(X1, y_bins)))
+            n_train = len(pool_idx)
+            n_test = len(test_idx)
+        
+        # Combine existing trials with new trials for statistics calculation
+        # Use only the MINIMUM number of existing trials to ensure arrays match
+        existing_m1_trials = existing_trials_dict.get(model1_name, {}).get(sample_size, [])
+        existing_m2_trials = existing_trials_dict.get(model2_name, {}).get(sample_size, [])
+        new_m1_trials = trial_data_dict.get(model1_name, {}).get(sample_size, [])
+        new_m2_trials = trial_data_dict.get(model2_name, {}).get(sample_size, [])
+        
+        # Truncate to minimum existing trials (one model may have more existing trials than the other)
+        min_existing = min(len(existing_m1_trials), len(existing_m2_trials))
+        existing_m1_trials = existing_m1_trials[:min_existing]
+        existing_m2_trials = existing_m2_trials[:min_existing]
+        
+        all_model1_trials = existing_m1_trials + new_m1_trials
+        all_model2_trials = existing_m2_trials + new_m2_trials
+        
+        # Check if we have any trials to compare
+        if len(all_model1_trials) == 0 or len(all_model2_trials) == 0:
+            print(f"  WARNING: No trials available for comparison at sample_size={sample_size}")
+            continue
+        
+        # Extract metrics from all trials: (fold_idx, repeat, ktau, mse)
+        all_model1_ktau = [t[2] for t in all_model1_trials]  # index 2 is ktau
+        all_model1_mse = [t[3] for t in all_model1_trials]   # index 3 is mse
+        
+        all_model2_ktau = [t[2] for t in all_model2_trials]  # index 2 is ktau
+        all_model2_mse = [t[3] for t in all_model2_trials]   # index 3 is mse
+        
+        # Convert to arrays
+        model1_ktau_array = np.array(all_model1_ktau)
+        model2_ktau_array = np.array(all_model2_ktau)
+        model1_mse_array = np.array(all_model1_mse)
+        model2_mse_array = np.array(all_model2_mse)
+        
+        # Calculate differences for all trials
+        all_differences_ktau = model1_ktau_array - model2_ktau_array
+        all_differences_mse = model1_mse_array - model2_mse_array
+        
+        # Calculate statistics on Kendall's Tau
+        model1_mean_ktau = np.mean(model1_ktau_array)
+        model1_std_ktau = np.std(model1_ktau_array)
+        model2_mean_ktau = np.mean(model2_ktau_array)
+        model2_std_ktau = np.std(model2_ktau_array)
+        mean_diff_ktau = np.mean(all_differences_ktau)
+        std_diff_ktau = np.std(all_differences_ktau)
+        
+        # Calculate statistics on MSE
+        model1_mean_mse = np.mean(model1_mse_array)
+        model1_std_mse = np.std(model1_mse_array)
+        model2_mean_mse = np.mean(model2_mse_array)
+        model2_std_mse = np.std(model2_mse_array)
+        mean_diff_mse = np.mean(all_differences_mse)
+        std_diff_mse = np.std(all_differences_mse)
+        
+        # Perform corrected paired t-test on both metrics (using ALL trials)
+        t_stat_ktau, p_value_ktau = corrected_paired_ttest(all_differences_ktau, n_train, n_test)
+        t_stat_mse, p_value_mse = corrected_paired_ttest(all_differences_mse, n_train, n_test)
+        
+        results.append({
+            'sample_size': sample_size,
+            'model1': model1_name,
+            'model2': model2_name,
+            'metric': 'kendall_tau',
+            'model1_mean_ktau': model1_mean_ktau,
+            'model1_std_ktau': model1_std_ktau,
+            'model2_mean_ktau': model2_mean_ktau,
+            'model2_std_ktau': model2_std_ktau,
+            'mean_diff_ktau': mean_diff_ktau,
+            'std_diff_ktau': std_diff_ktau,
+            't_statistic_ktau': t_stat_ktau,
+            'p_value_ktau': p_value_ktau,
+            'significant_ktau': p_value_ktau < 0.05,
+            'n_trials': len(all_model1_trials),  # Total trials (existing + new)
+            'n_train_actual': n_train,
+            'n_test_actual': n_test,
+            # MSE statistics and significance
+            'model1_mean_mse': model1_mean_mse,
+            'model1_std_mse': model1_std_mse,
+            'model2_mean_mse': model2_mean_mse,
+            'model2_std_mse': model2_std_mse,
+            'mean_diff_mse': mean_diff_mse,
+            'std_diff_mse': std_diff_mse,
+            't_statistic_mse': t_stat_mse,
+            'p_value_mse': p_value_mse,
+            'significant_mse': p_value_mse < 0.05
+        })
+        
+        # Detailed reporting
+        print(f"\n{'='*70}")
+        print(f"Results for Sample Size {sample_size}:")
+        print(f"{'='*70}")
+        print(f"  {model1_name}:")
+        print(f"    Kendall's Tau = {model1_mean_ktau:.4f} ± {model1_std_ktau:.4f}")
+        print(f"    MSE = {model1_mean_mse:.4f} ± {model1_std_mse:.4f}")
+        print(f"  {model2_name}:")
+        print(f"    Kendall's Tau = {model2_mean_ktau:.4f} ± {model2_std_ktau:.4f}")
+        print(f"    MSE = {model2_mean_mse:.4f} ± {model2_std_mse:.4f}")
+        print(f"  Difference (M1-M2): {mean_diff_ktau:.4f} ± {std_diff_ktau:.4f}")
+        if model1_mean_ktau < 0 or model2_mean_ktau < 0:
+            print(f"  ⚠ Negative Kendall's Tau: Model has negative rank correlation")
+        
+        # Determine which model is better based on observed difference
+        if mean_diff_ktau > 0:
+            # Model1 is better (positive difference)
+            better_model_ktau = model1_name
+            worse_model_ktau = model2_name
+            print(f"\nOne-Tailed Hypothesis Test (Kendall's Tau):")
+            print(f"  Observed: {model1_name} has higher Kendall's Tau")
+            print(f"  H0: {model1_name}_Tau ≤ {model2_name}_Tau (no real difference)")
+            print(f"  H1: {model1_name}_Tau > {model2_name}_Tau ({model1_name} is genuinely better)")
+        else:
+            # Model2 is better (negative difference)
+            better_model_ktau = model2_name
+            worse_model_ktau = model1_name
+            print(f"\nOne-Tailed Hypothesis Test (Kendall's Tau):")
+            print(f"  Observed: {model2_name} has higher Kendall's Tau")
+            print(f"  H0: {model2_name}_Tau ≤ {model1_name}_Tau (no real difference)")
+            print(f"  H1: {model2_name}_Tau > {model1_name}_Tau ({model2_name} is genuinely better)")
+        
+        print(f"  t-statistic: {t_stat_ktau:.3f}")
+        print(f"  p-value (one-tailed): {p_value_ktau:.4f}")
+        print(f"  → P-value tests if the observed advantage is statistically significant")
+        
+        if p_value_ktau < 0.05:
+            print(f"  ✓ SIGNIFICANT (p<0.05): {better_model_ktau} is significantly better than {worse_model_ktau}")
+        else:
+            print(f"  ✗ NOT SIGNIFICANT (p≥0.05): Cannot conclude which is better")
+        
+        # MSE significance test
+        print(f"\nOne-Tailed Hypothesis Test (MSE):")
+        print(f"  Difference (M1-M2): {mean_diff_mse:.4f} ± {std_diff_mse:.4f}")
+        print(f"  t-statistic: {t_stat_mse:.3f}, p-value: {p_value_mse:.4f}")
+        if p_value_mse < 0.05:
+            # For MSE, lower is better, so reverse the logic
+            better_model_mse = model2_name if mean_diff_mse > 0 else model1_name
+            worse_model_mse = model1_name if mean_diff_mse > 0 else model2_name
+            print(f"  ✓ SIGNIFICANT (p<0.05): {better_model_mse} is significantly better than {worse_model_mse}")
+        else:
+            print(f"  ✗ NOT SIGNIFICANT (p≥0.05): Cannot conclude which is better")
+        
+        print(f"{'='*70}")
+        
+        # Save results incrementally after each sample size completes
+        # Save even if no new trials were computed (for statistical comparison)
+        if per_embedding_output_dir and comparison_output_path:
+            print(f"\nSaving results for sample_size={sample_size}...")
+            
+            # Create mini result DataFrame for just this sample size
+            sample_result_df = pd.DataFrame([results[-1]])  # Last entry is current sample_size
+            
+            # Add metadata to match run_comparison format
+            sample_result_df['comparison_type'] = comparison_label if comparison_label else 'comparison'
+            sample_result_df['embedding1'] = model1_name.replace('_corpus1', '')
+            sample_result_df['embedding2'] = model2_name.replace('_corpus2', '')
+            sample_result_df['corpus1'] = corpus1_name if corpus1_name else 'corpus'
+            sample_result_df['corpus2'] = corpus2_name if corpus2_name else 'corpus'
+            
+            # Extract trials for this sample size from trial_data_dict (only NEW trials)
+            sample_trials_dict = {}
+            if trial_data_dict and trials_to_compute > 0:
+                # Only save Type 1 if we have NEW trials
+                if model1_name in trial_data_dict and sample_size in trial_data_dict[model1_name]:
+                    sample_trials_dict[model1_name] = {sample_size: trial_data_dict[model1_name][sample_size]}
+                if model2_name in trial_data_dict and sample_size in trial_data_dict[model2_name]:
+                    sample_trials_dict[model2_name] = {sample_size: trial_data_dict[model2_name][sample_size]}
+            
+            # Always save Type 2 comparison results (even if no new trials)
+            # Type 2 is the statistical comparison which we always want to save
+            if sample_trials_dict:
+                # We have new trials - save both Type 1 and Type 2
+                per_embedding_dict, comparison_df = split_results_for_saving(sample_result_df, sample_trials_dict)
+                
+                # Save Type 1: Per-embedding results (only if new trials)
+                for embedding_name, emb_df in per_embedding_dict.items():
+                    if len(emb_df) > 0:
+                        # Determine corpus name
+                        if embedding_name == model1_name:
+                            corpus_name_to_use = corpus1_name if corpus1_name else 'corpus'
+                        else:
+                            corpus_name_to_use = corpus2_name if corpus2_name else 'corpus'
+                        
+                        save_per_embedding_results(emb_df, per_embedding_output_dir, 
+                                                  embedding_name, corpus_name_to_use)
+                        print(f"  Saved Type 1 CSV for {embedding_name}")
+                
+                # Save Type 2: Comparison results
+                save_comparison_results(comparison_df, comparison_output_path)
+                print(f"  Saved Type 2 CSV for comparison")
+            else:
+                # No new trials, but still save Type 2 comparison results
+                # Create a dummy trials dict for split_results_for_saving
+                dummy_trials_dict = {
+                    model1_name: {sample_size: []},
+                    model2_name: {sample_size: []}
+                }
+                _, comparison_df = split_results_for_saving(sample_result_df, dummy_trials_dict)
+                
+                # Save Type 2 only
+                save_comparison_results(comparison_df, comparison_output_path)
+                print(f"  Saved Type 2 CSV for comparison (no new Type 1 trials)")
+    
+    return pd.DataFrame(results)
+
+
+
+def run_comparison(
+    embedding1_name,
+    corpus1_name,
+    embedding2_name,
+    corpus2_name,
+    corpus_path1,
+    corpus_path2=None,
+    comparison_label='comparison',
+    sample_sizes=[15, 50, 150, 500, 1500, 5000],
+    n_folds=5,
+    n_repeats=5,
+    benchmark_type='nasbench',
+    comparison_output_path=None,
+    per_embedding_output_dir=None,
+    device='cuda',
+    force=False,
+    dim_reduction_method_embedding1=None,
+    dim_reduction_method_embedding2=None,
+    dim_reduction_components_embedding1=None,
+    dim_reduction_components_embedding2=None,
+    pca_whitening_epsilon_embedding1=None,
+    pca_whitening_epsilon_embedding2=None,
+    use_pairwise_loss_embedding1=False,
+    use_pairwise_loss_embedding2=False,
+    use_single_target_embedding1=False,
+    use_single_target_embedding2=False,
+    head_type_embedding1='mlp',
+    head_type_embedding2='mlp',
+    combine_embeddings1=None,
+    combine_embeddings2=None
+):
+    """
+    Compare two embeddings (same corpus or cross-corpus).
+    
+    Workflow:
+      1. Load existing trials from Type 1 CSVs for both embeddings
+      2. Determine which trials are missing and run them
+      3. Save new trials to Type 1 CSVs
+      4. Compute aggregated statistics and save to Type 2 CSV
+    
+    Args:
+        embedding1_name: Name of first embedding (or base name if combine_embeddings1 is provided)
+        corpus1_name: Name identifier for corpus 1 (used in filenames)
+        embedding2_name: Name of second embedding (or base name if combine_embeddings2 is provided)
+        corpus2_name: Name identifier for corpus 2 (used in filenames)
+        corpus_path1: Path to corpus for embedding1 (and embedding2 if corpus_path2=None)
+        corpus_path2: Path to corpus for embedding2 (if None, use corpus_path1 for both)
+        comparison_label: Label for comparison (e.g., 'quant_vs_noquant')
+        sample_sizes: List of training sizes
+        n_folds: Number of CV folds
+        n_repeats: Number of CV repeats
+        benchmark_type: 'nasbench' or 'einspace'
+        comparison_output_path: Path to global comparison CSV (Type 2)
+        per_embedding_output_dir: Directory for per-embedding CSVs (Type 1)
+        device: Device to use
+        force: If True, ignore existing trials and recompute all
+        dim_reduction_method_embedding1: Dimensionality reduction for embedding1 (None, 'softpca', or 'umap')
+        dim_reduction_method_embedding2: Dimensionality reduction for embedding2 (None, 'softpca', or 'umap')
+        dim_reduction_components_embedding1: Number of components for embedding1
+        dim_reduction_components_embedding2: Number of components for embedding2
+        pca_whitening_epsilon_embedding1: Epsilon for SoftPCA whitening for embedding1
+        pca_whitening_epsilon_embedding2: Epsilon for SoftPCA whitening for embedding2
+        use_pairwise_loss_embedding1: If True, use pairwise hinge loss for embedding1
+        use_pairwise_loss_embedding2: If True, use pairwise hinge loss for embedding2
+        use_single_target_embedding1: If True, train embedding1 model only on valid accuracy
+        use_single_target_embedding2: If True, train embedding2 model only on valid accuracy
+        head_type_embedding1: Type of head for embedding1 ('mlp', 'xgboost', or 'perceiver')
+        head_type_embedding2: Type of head for embedding2 ('mlp', 'xgboost', or 'perceiver')
+        combine_embeddings1: If provided, list of embedding column names to concatenate for embedding1
+                            (e.g., ['yi_coder_1_5_pytorch_code_embedding', 'modernbert_large_pytorch_code_embedding'])
+        combine_embeddings2: If provided, list of embedding column names to concatenate for embedding2
+    
+    Returns:
+        DataFrame with comparison results
+    """
+    print(f"\n{'='*80}")
+    print(f"Comparison: {comparison_label}")
+    print(f"{'='*80}")
+    
+    # Determine if same corpus or cross-corpus
+    if corpus_path2 is None:
+        corpus_path2 = corpus_path1
+        is_cross_corpus = False
+    else:
+        is_cross_corpus = (corpus_path1 != corpus_path2)
+    
+    # Load corpus/corpora
+    if not is_cross_corpus:
+        # Same corpus comparison
+        print(f"Loading corpus from {corpus_path1}...")
+        df = pd.read_pickle(corpus_path1)
+        print(f"  Loaded {len(df)} architectures")
+        
+        # Handle embedding concatenation for embedding1
+        if combine_embeddings1 and len(combine_embeddings1) > 0:
+            # Concatenate multiple embeddings
+            print(f"\nCombining embeddings for embedding1: {combine_embeddings1}")
+            embedding1_arrays = []
+            for emb_name in combine_embeddings1:
+                if emb_name not in df.columns:
+                    raise ValueError(f"Embedding '{emb_name}' not found in corpus")
+                embedding1_arrays.append(np.array(df[emb_name].tolist()).astype(np.float32))
+            
+            # Concatenate along feature dimension
+            X1 = np.concatenate(embedding1_arrays, axis=-1)
+            
+            # Create combined name
+            combined_name1 = '+'.join([e.replace('_embedding', '') for e in combine_embeddings1]) + '_combined'
+            embedding1_name = combined_name1
+            print(f"  Combined shape: {X1.shape} (concatenated {len(combine_embeddings1)} embeddings)")
+        else:
+            # Single embedding
+            if embedding1_name not in df.columns:
+                raise ValueError(f"Embedding '{embedding1_name}' not found in corpus")
+            X1 = np.array(df[embedding1_name].tolist()).astype(np.float32)
+        
+        # Handle embedding concatenation for embedding2
+        if combine_embeddings2 and len(combine_embeddings2) > 0:
+            # Concatenate multiple embeddings
+            print(f"\nCombining embeddings for embedding2: {combine_embeddings2}")
+            embedding2_arrays = []
+            for emb_name in combine_embeddings2:
+                if emb_name not in df.columns:
+                    raise ValueError(f"Embedding '{emb_name}' not found in corpus")
+                embedding2_arrays.append(np.array(df[emb_name].tolist()).astype(np.float32))
+            
+            # Concatenate along feature dimension
+            X2 = np.concatenate(embedding2_arrays, axis=-1)
+            
+            # Create combined name
+            combined_name2 = '+'.join([e.replace('_embedding', '') for e in combine_embeddings2]) + '_combined'
+            embedding2_name = combined_name2
+            print(f"  Combined shape: {X2.shape} (concatenated {len(combine_embeddings2)} embeddings)")
+        else:
+            # Single embedding
+            if embedding2_name not in df.columns:
+                raise ValueError(f"Embedding '{embedding2_name}' not found in corpus")
+            X2 = np.array(df[embedding2_name].tolist()).astype(np.float32)
+
+        
+        # Create unique model names with configuration suffixes
+        # This ensures different training configurations are distinguished even for same embedding
+        model1_name = embedding1_name
+        if dim_reduction_method_embedding1:
+            n_comp = dim_reduction_components_embedding1 if dim_reduction_components_embedding1 else 'auto'
+            model1_name = f"{model1_name}_{dim_reduction_method_embedding1}{n_comp}"
+            # Add whitening epsilon if using softpca
+            if dim_reduction_method_embedding1 == 'softpca' and pca_whitening_epsilon_embedding1 is not None:
+                model1_name = f"{model1_name}_eps{pca_whitening_epsilon_embedding1}"
+        if use_pairwise_loss_embedding1:
+            model1_name = f"{model1_name}_pairwise"
+        if use_single_target_embedding1:
+            model1_name = f"{model1_name}_singletarget"
+        if head_type_embedding1 != 'mlp':  # Only add suffix if not default
+            model1_name = f"{model1_name}_{head_type_embedding1}"
+        
+        model2_name = embedding2_name
+        if dim_reduction_method_embedding2:
+            n_comp = dim_reduction_components_embedding2 if dim_reduction_components_embedding2 else 'auto'
+            model2_name = f"{model2_name}_{dim_reduction_method_embedding2}{n_comp}"
+            # Add whitening epsilon if using softpca
+            if dim_reduction_method_embedding2 == 'softpca' and pca_whitening_epsilon_embedding2 is not None:
+                model2_name = f"{model2_name}_eps{pca_whitening_epsilon_embedding2}"
+        if use_pairwise_loss_embedding2:
+            model2_name = f"{model2_name}_pairwise"
+        if use_single_target_embedding2:
+            model2_name = f"{model2_name}_singletarget"
+        if head_type_embedding2 != 'mlp':  # Only add suffix if not default
+            model2_name = f"{model2_name}_{head_type_embedding2}"
+        
+        corpus1 = corpus_path1
+        corpus2 = corpus_path1
+        
+    else:
+        # Cross-corpus comparison
+        print(f"Loading corpus 1 from {corpus_path1}...")
+        df1 = pd.read_pickle(corpus_path1)
+        print(f"  Loaded {len(df1)} architectures")
+        
+        print(f"Loading corpus 2 from {corpus_path2}...")
+        df2 = pd.read_pickle(corpus_path2)
+        print(f"  Loaded {len(df2)} architectures")
+        
+        if len(df1) != len(df2):
+            raise ValueError(f"Corpus sizes don't match: {len(df1)} vs {len(df2)}")
+        
+        # Handle embedding concatenation for embedding1
+        if combine_embeddings1 and len(combine_embeddings1) > 0:
+            # Concatenate multiple embeddings
+            print(f"\nCombining embeddings for embedding1: {combine_embeddings1}")
+            embedding1_arrays = []
+            for emb_name in combine_embeddings1:
+                if emb_name not in df1.columns:
+                    raise ValueError(f"Embedding '{emb_name}' not found in corpus 1")
+                embedding1_arrays.append(np.array(df1[emb_name].tolist()).astype(np.float32))
+            
+            # Concatenate along feature dimension
+            X1 = np.concatenate(embedding1_arrays, axis=-1)
+            
+            # Create combined name
+            combined_name1 = '+'.join([e.replace('_embedding', '') for e in combine_embeddings1]) + '_combined'
+            embedding1_name = combined_name1
+            print(f"  Combined shape: {X1.shape} (concatenated {len(combine_embeddings1)} embeddings)")
+        else:
+            # Single embedding
+            if embedding1_name not in df1.columns:
+                raise ValueError(f"Embedding '{embedding1_name}' not found in corpus 1")
+            X1 = np.array(df1[embedding1_name].tolist()).astype(np.float32)
+        
+        # Handle embedding concatenation for embedding2
+        if combine_embeddings2 and len(combine_embeddings2) > 0:
+            # Concatenate multiple embeddings
+            print(f"\nCombining embeddings for embedding2: {combine_embeddings2}")
+            embedding2_arrays = []
+            for emb_name in combine_embeddings2:
+                if emb_name not in df2.columns:
+                    raise ValueError(f"Embedding '{emb_name}' not found in corpus 2")
+                embedding2_arrays.append(np.array(df2[emb_name].tolist()).astype(np.float32))
+            
+            # Concatenate along feature dimension
+            X2 = np.concatenate(embedding2_arrays, axis=-1)
+            
+            # Create combined name
+            combined_name2 = '+'.join([e.replace('_embedding', '') for e in combine_embeddings2]) + '_combined'
+            embedding2_name = combined_name2
+            print(f"  Combined shape: {X2.shape} (concatenated {len(combine_embeddings2)} embeddings)")
+        else:
+            # Single embedding
+            if embedding2_name not in df2.columns:
+                raise ValueError(f"Embedding '{embedding2_name}' not found in corpus 2")
+            X2 = np.array(df2[embedding2_name].tolist()).astype(np.float32)
+        
+        # Create unique model names with corpus and configuration suffixes
+        model1_name = f"{embedding1_name}_corpus1"
+        if dim_reduction_method_embedding1:
+            n_comp = dim_reduction_components_embedding1 if dim_reduction_components_embedding1 else 'auto'
+            model1_name = f"{model1_name}_{dim_reduction_method_embedding1}{n_comp}"
+            # Add whitening epsilon if using softpca
+            if dim_reduction_method_embedding1 == 'softpca' and pca_whitening_epsilon_embedding1 is not None:
+                model1_name = f"{model1_name}_eps{pca_whitening_epsilon_embedding1}"
+        if use_pairwise_loss_embedding1:
+            model1_name = f"{model1_name}_pairwise"
+        if use_single_target_embedding1:
+            model1_name = f"{model1_name}_singletarget"
+        if head_type_embedding1 != 'mlp':  # Only add suffix if not default
+            model1_name = f"{model1_name}_{head_type_embedding1}"
+        
+        model2_name = f"{embedding2_name}_corpus2"
+        if dim_reduction_method_embedding2:
+            n_comp = dim_reduction_components_embedding2 if dim_reduction_components_embedding2 else 'auto'
+            model2_name = f"{model2_name}_{dim_reduction_method_embedding2}{n_comp}"
+            # Add whitening epsilon if using softpca
+            if dim_reduction_method_embedding2 == 'softpca' and pca_whitening_epsilon_embedding2 is not None:
+                model2_name = f"{model2_name}_eps{pca_whitening_epsilon_embedding2}"
+        if use_pairwise_loss_embedding2:
+            model2_name = f"{model2_name}_pairwise"
+        if use_single_target_embedding2:
+            model2_name = f"{model2_name}_singletarget"
+        if head_type_embedding2 != 'mlp':  # Only add suffix if not default
+            model2_name = f"{model2_name}_{head_type_embedding2}"
+        
+        corpus1 = corpus_path1
+        corpus2 = corpus_path2
+        df = df1  # Use first dataframe for targets
+    
+    # Prepare targets
+    if benchmark_type == 'nasbench':
+        y = df[['cifar10-valid_valid_loss', 'cifar10-valid_valid_accuracy']].values.astype(np.float32)
+    elif benchmark_type == 'einspace':
+        y = df[['accuracy', 'accuracy']].values.astype(np.float32)
+    else:
+        raise ValueError(f"Unknown benchmark_type: {benchmark_type}")
+    
+    print(f"Targets shape: {y.shape}, dtype: {y.dtype}")
+    
+    print(f"\nComparing: {model1_name} vs {model2_name}")
+    print(f"  {model1_name}: {X1.shape}")
+    print(f"  {model2_name}: {X2.shape}")
+    print(f"{'='*80}\n")
+    
+    # Load existing trials from Type 1 CSVs
+    # Load using full model name (with config suffixes like _pca64, etc.)
+    existing_trials_dict = {}  # Existing trials loaded from disk
+    new_trials_dict = {}  # New trials to be computed and saved
+    if not force and per_embedding_output_dir:
+        print(f"Loading existing trials from Type 1 CSVs...")
+        
+        # Load using full model name (includes all config suffixes)
+        existing_trials_dict[model1_name] = load_existing_trials(
+            per_embedding_output_dir, model1_name, corpus1_name
+        )
+        existing_trials_dict[model2_name] = load_existing_trials(
+            per_embedding_output_dir, model2_name, corpus2_name
+        )
+        
+        total_m1 = sum(len(trials) for trials in existing_trials_dict[model1_name].values())
+        total_m2 = sum(len(trials) for trials in existing_trials_dict[model2_name].values())
+        print(f"  {model1_name}: {total_m1} existing trials")
+        print(f"  {model2_name}: {total_m2} existing trials")
+    
+    # Prepare X dict
+    X = {model1_name: X1, model2_name: X2}
+    embedding_types = [model1_name, model2_name]
+    
+    # Print dimensionality reduction, pairwise loss, single target, and head type info if enabled
+    if dim_reduction_method_embedding1 or dim_reduction_method_embedding2 or use_pairwise_loss_embedding1 or use_pairwise_loss_embedding2 or use_single_target_embedding1 or use_single_target_embedding2 or head_type_embedding1 != 'mlp' or head_type_embedding2 != 'mlp':
+        print(f"\nConfiguration:")
+        print(f"  {model1_name}: Head type = {head_type_embedding1}")
+        if dim_reduction_method_embedding1:
+            comp1 = dim_reduction_components_embedding1 if dim_reduction_components_embedding1 else "auto"
+            print(f"  {model1_name}: {dim_reduction_method_embedding1.upper()} enabled, n_components={comp1}")
+        if use_pairwise_loss_embedding1:
+            print(f"  {model1_name}: Pairwise hinge loss enabled")
+        if use_single_target_embedding1:
+            print(f"  {model1_name}: Single target (valid accuracy only)")
+        else:
+            print(f"  {model1_name}: Dual target (loss + accuracy)")
+            
+        print(f"  {model2_name}: Head type = {head_type_embedding2}")
+        if dim_reduction_method_embedding2:
+            comp2 = dim_reduction_components_embedding2 if dim_reduction_components_embedding2 else "auto"
+            print(f"  {model2_name}: {dim_reduction_method_embedding2.upper()} enabled, n_components={comp2}")
+        if use_pairwise_loss_embedding2:
+            print(f"  {model2_name}: Pairwise hinge loss enabled")
+        if use_single_target_embedding2:
+            print(f"  {model2_name}: Single target (valid accuracy only)")
+        else:
+            print(f"  {model2_name}: Dual target (loss + accuracy)")
+        print()
+    
+    # Run comparison (new_trials_dict will be populated with NEW trials only)
+    # Results will be saved incrementally after each sample size
+    result_df = subsampled_repeated_kfold_comparison(
+        X, y, embedding_types,
+        sample_sizes=sample_sizes,
+        n_folds=n_folds,
+        n_repeats=n_repeats,
+        model1_idx=0,
+        model2_idx=1,
+        device=device,
+        pairs_to_compute=None,
+        trial_data_dict=new_trials_dict,
+        existing_trials_dict=existing_trials_dict,
+        dim_reduction_method_model1=dim_reduction_method_embedding1,
+        dim_reduction_method_model2=dim_reduction_method_embedding2,
+        dim_reduction_components_model1=dim_reduction_components_embedding1,
+        dim_reduction_components_model2=dim_reduction_components_embedding2,
+        pca_whitening_epsilon_model1=pca_whitening_epsilon_embedding1,
+        pca_whitening_epsilon_model2=pca_whitening_epsilon_embedding2,
+        use_pairwise_loss_model1=use_pairwise_loss_embedding1,
+        use_pairwise_loss_model2=use_pairwise_loss_embedding2,
+        use_single_target_model1=use_single_target_embedding1,
+        use_single_target_model2=use_single_target_embedding2,
+        head_type_model1=head_type_embedding1,
+        head_type_model2=head_type_embedding2,
+        per_embedding_output_dir=per_embedding_output_dir,
+        comparison_output_path=comparison_output_path,
+        corpus1_name=corpus1_name,
+        corpus2_name=corpus2_name,
+        comparison_label=comparison_label
+    )
+    
+    # Add metadata (for consistency, even though saving happened incrementally)
+    result_df['comparison_type'] = comparison_label
+    
+    # Use model names for display (already have config suffixes: _pca64, _pairwise, etc.)
+    # Strip corpus suffix if present (for cross-corpus comparisons)
+    embedding1_display = model1_name.replace('_corpus1', '')
+    embedding2_display = model2_name.replace('_corpus2', '')
+    
+    result_df['embedding1'] = embedding1_display
+    result_df['embedding2'] = embedding2_display
+    result_df['corpus1'] = corpus1_name
+    result_df['corpus2'] = corpus2_name
+
+    # Note: Results have already been saved incrementally after each sample size
+    print(f"\nAll results saved incrementally during computation.")
+    
+    return result_df

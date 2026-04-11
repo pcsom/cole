@@ -1,0 +1,202 @@
+import torch
+import pickle
+import json
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+from stringify_utils import arch_to_pytorch_code, get_api, get_architecture_string
+import argparse
+
+def get_arch_properties(arch_index, dataset='cifar10-valid'):
+    """
+    Get regressable properties (fitness metrics) for an architecture.
+    
+    Args:
+        arch_index: Architecture index in NASBench-201
+        dataset: Dataset to query ('cifar10-valid', 'cifar100', 'ImageNet16-120')
+    
+    Returns:
+        Dictionary of properties
+    """
+    # Get architecture metrics
+    api = get_api()
+    info = api.get_more_info(arch_index, dataset=dataset, hp='200', is_random=False)
+    
+    # Safely extract properties with defaults for missing keys
+    properties = {
+        'test_accuracy': info.get('test-accuracy', None),
+        'valid_accuracy': info.get('valid-accuracy', None),
+        'train_accuracy': info.get('train-accuracy', None),
+        'test_loss': info.get('test-loss', None),
+        'valid_loss': info.get('valid-loss', None),
+        'train_loss': info.get('train-loss', None),
+        'train_time': info.get('train-all-time', None),  # Training time in seconds
+        'flops': info.get('flops', None),  # FLOPs
+        'genertion_time': info.get('generation_time', None)  # Time to generate the architecture
+    }
+    
+    return properties
+
+def get_arch_properties_averaged(arch_index, dataset='cifar10-valid'):
+    """
+    Get regressable properties (fitness metrics) for an architecture.
+    Explicitly averages results across the 3 standard NAS-Bench-201 seeds (777, 888, 999).
+    
+    Args:
+        arch_index: Architecture index in NASBench-201
+        dataset: Dataset to query ('cifar10-valid', 'cifar100', 'ImageNet16-120')
+    
+    Returns:
+        Dictionary of properties (mean values)
+    """
+    api = get_api()
+    
+    # 1. Query detailed results for this index and dataset
+    # This returns a dict where keys are seeds (777, 888, 999)
+    results_dict = api.query_by_index(arch_index, dataset)
+    
+    # Storage for metrics across seeds
+    accuracies = {'test': [], 'valid': [], 'train': []}
+    losses = {'test': [], 'valid': [], 'train': []}
+    times = []
+    
+    # 2. Iterate through all available seeds and extract 200-epoch metrics
+    for seed, result_obj in results_dict.items():
+        # result_obj is an instance of ResultsCount
+        # get_eval returns: {'accuracy': X, 'loss': Y, ...}
+        
+        # Test Data
+        test_info = result_obj.get_eval('x-test') 
+        accuracies['test'].append(test_info['accuracy'])
+        losses['test'].append(test_info['loss'])
+        
+        # Validation Data
+        valid_info = result_obj.get_eval('x-valid')
+        accuracies['valid'].append(valid_info['accuracy'])
+        losses['valid'].append(valid_info['loss'])
+        
+        # Training Data
+        train_info = result_obj.get_train()
+        accuracies['train'].append(train_info['accuracy'])
+        losses['train'].append(train_info['loss'])
+        times.append(train_info['all_time'])
+
+    # 3. Calculate Means
+    properties = {
+        'test_accuracy': np.mean(accuracies['test']),
+        'valid_accuracy': np.mean(accuracies['valid']),
+        'train_accuracy': np.mean(accuracies['train']),
+        'test_loss': np.mean(losses['test']),
+        'valid_loss': np.mean(losses['valid']),
+        'train_loss': np.mean(losses['train']),
+        'train_time': np.mean(times),
+        'flops': results_dict[777].get_compute_costs(dataset)['flops'], # FLOPs are constant across seeds
+    }
+    
+    return properties
+
+
+def generate_pytorch_corpus(output_path,
+                           datasets=['cifar10-valid', 'cifar100', 'ImageNet16-120'],
+                           context_mode=None):
+    """
+    Generate corpus with PyTorch code representations for all 3 primitives modes.
+    
+    Args:
+        output_path: Path to save the corpus (.pkl file)
+        datasets: List of datasets to include metrics for
+        context_mode: None (cell only), 'network' (full code), or 'comment' (docstring)
+    
+    Returns:
+        DataFrame with all architectures and their PyTorch code in 3 primitives modes
+    """
+    api = get_api()
+    context_str = f"with context_mode='{context_mode}'" if context_mode else "without context"
+    print(f"Generating NASBench-201 PyTorch corpus for all primitives modes {context_str}...")
+    print(f"Total architectures: {len(api)}")
+    
+    data_rows = []
+    
+    for arch_idx in tqdm(range(len(api)), desc="Processing architectures"):
+        # Get architecture string
+        arch_string = get_architecture_string(arch_idx)
+        
+        # Generate PyTorch code for all 3 primitives modes
+        pytorch_code_inline = arch_to_pytorch_code(arch_idx, context_mode=context_mode, primitives_mode='inline')
+        pytorch_code_helper = arch_to_pytorch_code(arch_idx, context_mode=context_mode, primitives_mode='helper')
+        pytorch_code_exclude_helper = arch_to_pytorch_code(arch_idx, context_mode=context_mode, primitives_mode='exclude_helper')
+        
+        # Base entry with architecture info and all 3 pytorch code variants
+        entry = {
+            'arch_index': arch_idx,
+            'arch_string': arch_string,
+            'pytorch_code_inline': pytorch_code_inline,
+            'pytorch_code_helper': pytorch_code_helper,
+            'pytorch_code_exclude_helper': pytorch_code_exclude_helper
+        }
+        
+        # Get properties for each dataset and add to entry
+        for dataset in datasets:
+            props = get_arch_properties(arch_idx, dataset=dataset)
+            # Prefix keys with dataset name
+            for key, value in props.items():
+                entry[f'{dataset}_{key}'] = value
+        
+        data_rows.append(entry)
+    
+    # Create DataFrame
+    print(f"\nCreating DataFrame...")
+    df = pd.DataFrame(data_rows)
+    
+    # Save as pickle
+    print(f"Saving corpus to {output_path}")
+    df.to_pickle(output_path)
+    
+    # Also save as CSV
+    csv_path = output_path.replace('.pkl', '.csv')
+    print(f"Saving CSV version to {csv_path}")
+    df.to_csv(csv_path, index=False)
+    
+    # Save first 10 rows as JSON for inspection
+    json_path = output_path.replace('.pkl', '_sample.json')
+    print(f"Saving sample JSON to {json_path}")
+    df.head(10).to_json(json_path, orient='records', indent=2)
+    
+    print(f"\nCorpus generation complete!")
+    print(f"Total entries: {len(df)}")
+    print(f"DataFrame shape: {df.shape}")
+    print(f"\nColumns: {list(df.columns)}")
+    print(f"\nPyTorch code columns:")
+    print(f"  - pytorch_code_inline")
+    print(f"  - pytorch_code_helper")
+    print(f"  - pytorch_code_exclude_helper")
+    
+    return df
+
+if __name__ == "__main__":
+    args = argparse.ArgumentParser(description='Generate NASBench-201 corpus with architecture representations and properties')
+    args.add_argument('--output_path', type=str, required=True, help='Path to save the generated corpus (.pkl file)')
+
+    # Generate corpus for all three datasets
+    df = generate_pytorch_corpus(output_path=args.output_path)
+    
+    # Print example
+    print("\n" + "="*80)
+    print("Example corpus entries:")
+    print("="*80)
+    print("\nFirst 3 rows:")
+    print(df.head(3))
+
+    print("\nColumns:")
+    print(list(df.columns))
+    
+    print("\n" + "="*80)
+    print("Example architecture details:")
+    print("="*80)
+    example = df.iloc[0]
+    print(f"\nArchitecture Index: {example['arch_index']}")
+    print(f"Architecture String: {example['arch_string']}")
+    print(f"\nSample Properties:")
+    prop_cols = [col for col in df.columns if 'cifar10-valid' in col][:5]
+    for col in prop_cols:
+        print(f"  {col}: {example[col]}")
